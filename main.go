@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
 	"os"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type MbpResult struct {
@@ -19,11 +20,12 @@ type MbpResponse struct {
 	Results []MbpResult
 }
 
-func getCurrentStatus() string {
-	r, err := http.Get("https://my.mobilityplus.be/sp/api/20/user/charging/locations?window=50.88267564845102,4.681929475410969,50.88045876964255,4.687765962227375&limit=100&offset=0&has_point=true")
+func getCurrentStatus() (string, []string) {
+	mobilityPlusLocation := os.Getenv("MBP_LOCATION")
+	r, err := http.Get(fmt.Sprintf("https://my.mobilityplus.be/sp/api/20/user/charging/locations/%s/evses/", mobilityPlusLocation))
 	if err != nil {
 		log.WithError(err)
-		return "unknown"
+		return "unknown", []string{}
 	}
 	defer r.Body.Close()
 
@@ -32,9 +34,19 @@ func getCurrentStatus() string {
 	err = json.NewDecoder(r.Body).Decode(&mbpResonse)
 	if err != nil {
 		log.WithError(err)
-		return "unknown"
+		return "unknown", []string{}
 	}
-	return mbpResonse.Results[0].Status
+
+	availableCount := 0
+	statuses := []string{}
+	for _, res := range mbpResonse.Results {
+		if res.Status == "available" {
+			availableCount += 1
+		}
+		statuses = append(statuses, res.Status)
+	}
+
+	return fmt.Sprintf("Chargers available: %d", availableCount), statuses
 }
 
 type PushBulletData struct {
@@ -44,10 +56,17 @@ type PushBulletData struct {
 	Type  string `json:"type"`
 }
 
-func sendPBAlert(status string, pushBulletApiKey string, deviceId string) bool {
+func sendPBAlert(status string, statuses []string, pushBulletApiKey string, deviceId string) bool {
+
+	bodyString := "Status of chargers:\n"
+
+	for _, status := range statuses {
+		bodyString += fmt.Sprintf(" • %s\n", status)
+	}
+
 	data := PushBulletData{
 		Iden:  deviceId,
-		Body:  fmt.Sprintf("Status of the nearby charger changed to %s", status),
+		Body:  bodyString,
 		Title: status,
 		Type:  "note",
 	}
@@ -81,16 +100,16 @@ func main() {
 	lastStatus := ""
 
 	for {
-		status := getCurrentStatus()
-		log.Infoln("Current status: ", status)
+		status, statuses := getCurrentStatus()
+		log.Infoln(status)
 		if status != lastStatus {
 			log.Infoln("Sending alert")
-			success := sendPBAlert(status, pushBulletApiKey, deviceId)
+			success := sendPBAlert(status, statuses, pushBulletApiKey, deviceId)
 			if success {
 				lastStatus = status
 			}
 		}
-		time.Sleep(10 * time.Second)
+		time.Sleep(1 * time.Minute)
 	}
 
 }
