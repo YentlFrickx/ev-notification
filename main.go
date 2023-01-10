@@ -9,6 +9,8 @@ import (
 	"os"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -20,12 +22,54 @@ type MbpResponse struct {
 	Results []MbpResult
 }
 
-func getCurrentStatus() (string, []string) {
-	mobilityPlusLocation := os.Getenv("MBP_LOCATION")
-	r, err := http.Get(fmt.Sprintf("https://my.mobilityplus.be/sp/api/20/user/charging/locations/%s/evses/", mobilityPlusLocation))
+type MbpConfig struct {
+	LocationGroups []struct {
+		GroupName string   `yaml:"groupName"`
+		Locations []string `yaml:"locations"`
+	} `yaml:"locationGroups"`
+}
+
+func getLocationConfig() (*MbpConfig, error) {
+	filePath, set := os.LookupEnv("MBP_CONFIG_FILE")
+	if set {
+		buf, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, err
+		}
+
+		config := &MbpConfig{}
+		err = yaml.Unmarshal(buf, config)
+		if err != nil {
+			return nil, fmt.Errorf("in file %q: %w", filePath, err)
+		}
+		return config, nil
+	} else {
+		location, set := os.LookupEnv("MBP_LOCATION")
+		if !set {
+			log.Fatalf("No location configured")
+		}
+		return &MbpConfig{
+			LocationGroups: []struct {
+				GroupName string   `yaml:"groupName"`
+				Locations []string `yaml:"locations"`
+			}([]struct {
+				GroupName string
+				Locations []string
+			}{
+				{
+					GroupName: "",
+					Locations: []string{location},
+				},
+			}),
+		}, nil
+	}
+}
+
+func getCurrentStatus(locationId string) (int, []string) {
+	r, err := http.Get(fmt.Sprintf("https://my.mobilityplus.be/sp/api/20/user/charging/locations/%s/evses/", locationId))
 	if err != nil {
 		log.WithError(err)
-		return "unknown", []string{}
+		return 0, []string{}
 	}
 	defer r.Body.Close()
 
@@ -34,7 +78,7 @@ func getCurrentStatus() (string, []string) {
 	err = json.NewDecoder(r.Body).Decode(&mbpResonse)
 	if err != nil {
 		log.WithError(err)
-		return "unknown", []string{}
+		return 0, []string{}
 	}
 
 	availableCount := 0
@@ -46,7 +90,7 @@ func getCurrentStatus() (string, []string) {
 		statuses = append(statuses, res.Status)
 	}
 
-	return fmt.Sprintf("Chargers available: %d", availableCount), statuses
+	return availableCount, statuses
 }
 
 type PushBulletData struct {
@@ -56,18 +100,11 @@ type PushBulletData struct {
 	Type  string `json:"type"`
 }
 
-func sendPBAlert(status string, statuses []string, pushBulletApiKey string, deviceId string) bool {
-
-	bodyString := "Status of chargers:\n"
-
-	for _, status := range statuses {
-		bodyString += fmt.Sprintf(" • %s\n", status)
-	}
-
+func sendPBAlert(title string, bodyString string, pushBulletApiKey string, deviceId string) bool {
 	data := PushBulletData{
 		Iden:  deviceId,
 		Body:  bodyString,
-		Title: status,
+		Title: title,
 		Type:  "note",
 	}
 	body, _ := json.Marshal(data)
@@ -94,22 +131,60 @@ func sendPBAlert(status string, statuses []string, pushBulletApiKey string, devi
 	return true
 }
 
-func main() {
-	pushBulletApiKey := os.Getenv("PB_KEY")
-	deviceId := os.Getenv("DEVICE_ID")
-	lastStatus := ""
-
-	for {
-		status, statuses := getCurrentStatus()
-		log.Infoln(status)
-		if status != lastStatus {
-			log.Infoln("Sending alert")
-			success := sendPBAlert(status, statuses, pushBulletApiKey, deviceId)
-			if success {
-				lastStatus = status
-			}
-		}
-		time.Sleep(1 * time.Minute)
+func createNotification(groupName string, availableAmount int, statuses []string) (string, string) {
+	if groupName != "" {
+		groupName = " in " + groupName
 	}
+	title := fmt.Sprintf("%d chargers available%s", availableAmount, groupName)
+	bodyString := fmt.Sprintf("Status of chargers%s:\n", groupName)
+	for _, status := range statuses {
+		bodyString += fmt.Sprintf(" • %s\n", status)
+	}
+	return title, bodyString
+}
+
+func main() {
+	pushBulletApiKey, set := os.LookupEnv("PB_KEY")
+	if !set {
+		log.Fatalf("Missing PushBullet API key")
+	}
+
+	deviceId, set := os.LookupEnv("DEVICE_ID")
+	if !set {
+		log.Fatalf("Missing PushBullet device id")
+	}
+
+	conf, err := getLocationConfig()
+	if err != nil {
+		log.WithError(err)
+		return
+	}
+
+	groups := conf.LocationGroups
+	for _, group := range groups {
+		log.Printf("Setup group: %s", group.GroupName)
+		group := group
+		go func() {
+			lastTotalAmount := 0
+			for {
+				var currentStatuses []string
+				totalAmount := 0
+				for _, location := range group.Locations {
+					status, statuses := getCurrentStatus(location)
+					currentStatuses = append(currentStatuses, statuses...)
+					totalAmount += status
+				}
+				title, notification := createNotification(group.GroupName, totalAmount, currentStatuses)
+				if lastTotalAmount != totalAmount {
+					log.Infof("Sending notification for %s", group.GroupName)
+					sendPBAlert(title, notification, pushBulletApiKey, deviceId)
+					lastTotalAmount = totalAmount
+				}
+				time.Sleep(1 * time.Minute)
+			}
+		}()
+	}
+
+	select {}
 
 }
