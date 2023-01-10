@@ -4,6 +4,9 @@ GO project to send a push notification through pushbullet when the status of a m
 
 ## Running
 
+A docker image is publicly available at https://hub.docker.com/r/yfrickx/ev-notification.
+Either a stable tag can be used, which corresponds to github releases or the alpha tag can be used, which is build from the latest commit on the main branch.
+
 To run the project you can use docker, three environment variables should be set:
 | Env variable | use                                                                                                                                                                                                                  |
 |--------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
